@@ -3,16 +3,23 @@ import json
 import time
 import threading
 import requests
-from openai import OpenAI
 from pymongo import MongoClient, errors
 
 app = Flask(__name__)
 
-# OpenAI client for LLM call
-llm_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key="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"
-)
+# Import OpenAI with error handling for version compatibility
+try:
+    from openai import OpenAI
+    # OpenAI client for LLM call
+    llm_client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="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"
+    )
+    print("✅ OpenAI client initialized successfully")
+except Exception as e:
+    print(f"❌ OpenAI client initialization failed: {e}")
+    # Fallback - app will still work for serving existing data
+    llm_client = None
 
 # MongoDB connection
 client = MongoClient("mongodb+srv://vishwateja2502:vishwa%4025@cluster0.ig42emq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
@@ -165,86 +172,106 @@ def process_single_call(call, call_index):
         prompt = build_prompt(transcript)
         
         try:
-            response = llm_client.chat.completions.create(
-                model="meta-llama/llama-3-8b-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=2000,
-                timeout=30
-            )
-            
-            # Parse the LLM response
-            analysis_text = response.choices[0].message.content.strip()
-            
-            # Try delimited format first
-            if '|||' in analysis_text:
-                try:
-                    parts = analysis_text.split('|||')
-                    if len(parts) >= 8:
-                        analysis_data = {
-                            "sentiment": parts[0].replace('SENTIMENT:', '').strip(),
-                            "customer_emotion_journey": parts[1].replace('CUSTOMER_EMOTION_JOURNEY:', '').strip(),
-                            "topic_identification": parts[2].replace('TOPIC_IDENTIFICATION:', '').strip(),
-                            "primary_call_intent": parts[3].replace('PRIMARY_CALL_INTENT:', '').strip(),
-                            "transfer_reason": parts[4].replace('TRANSFER_REASON:', '').strip(),
-                            "competitors_mentioned": parts[5].replace('COMPETITORS_MENTIONED:', '').strip(),
-                            "key_themes_identified": parts[6].replace('KEY_THEMES_IDENTIFIED:', '').strip(),
-                            "overall_context": parts[7].replace('OVERALL_CONTEXT:', '').strip()
-                        }
-                    else:
-                        return {"call_id": call_id, "status": "error", "message": "Insufficient delimited parts"}
-                except Exception as e:
-                    return {"call_id": call_id, "status": "error", "message": str(e)}
-            
-            # Fallback to JSON parsing
+            if llm_client is None:
+                # If OpenAI client failed to initialize, store error
+                analysis_data = {
+                    "sentiment": "OpenAI client not available - deployment issue",
+                    "customer_emotion_journey": "OpenAI client not available - deployment issue",
+                    "topic_identification": "OpenAI client not available - deployment issue",
+                    "primary_call_intent": "OpenAI client not available - deployment issue", 
+                    "transfer_reason": "OpenAI client not available - deployment issue",
+                    "competitors_mentioned": "OpenAI client not available - deployment issue",
+                    "key_themes_identified": "OpenAI client not available - deployment issue",
+                    "overall_context": "OpenAI client not available - deployment issue"
+                }
             else:
-                try:
-                    analysis_data = json.loads(analysis_text)
-                except json.JSONDecodeError:
-                    # Try to repair truncated JSON
+                response = llm_client.chat.completions.create(
+                    model="meta-llama/llama-3-8b-instruct",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=2000,
+                    timeout=30
+                )
+                response = llm_client.chat.completions.create(
+                    model="meta-llama/llama-3-8b-instruct",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=2000,
+                    timeout=30
+                )
+                
+                # Parse the LLM response
+                analysis_text = response.choices[0].message.content.strip()
+                
+                # Try delimited format first
+                if '|||' in analysis_text:
                     try:
-                        fixed_text = analysis_text.strip()
-                        if fixed_text.count('"') % 2 == 1:
-                            fixed_text += '"'
-                        if not fixed_text.endswith('}'):
-                            fixed_text += '}'
-                        
-                        analysis_data = json.loads(fixed_text)
-                    except:
-                        # Extract partial data using regex
+                        parts = analysis_text.split('|||')
+                        if len(parts) >= 8:
+                            analysis_data = {
+                                "sentiment": parts[0].replace('SENTIMENT:', '').strip(),
+                                "customer_emotion_journey": parts[1].replace('CUSTOMER_EMOTION_JOURNEY:', '').strip(),
+                                "topic_identification": parts[2].replace('TOPIC_IDENTIFICATION:', '').strip(),
+                                "primary_call_intent": parts[3].replace('PRIMARY_CALL_INTENT:', '').strip(),
+                                "transfer_reason": parts[4].replace('TRANSFER_REASON:', '').strip(),
+                                "competitors_mentioned": parts[5].replace('COMPETITORS_MENTIONED:', '').strip(),
+                                "key_themes_identified": parts[6].replace('KEY_THEMES_IDENTIFIED:', '').strip(),
+                                "overall_context": parts[7].replace('OVERALL_CONTEXT:', '').strip()
+                            }
+                        else:
+                            return {"call_id": call_id, "status": "error", "message": "Insufficient delimited parts"}
+                    except Exception as e:
+                        return {"call_id": call_id, "status": "error", "message": str(e)}
+                
+                # Fallback to JSON parsing
+                else:
+                    try:
+                        analysis_data = json.loads(analysis_text)
+                    except json.JSONDecodeError:
+                        # Try to repair truncated JSON
                         try:
-                            import re
+                            fixed_text = analysis_text.strip()
+                            if fixed_text.count('"') % 2 == 1:
+                                fixed_text += '"'
+                            if not fixed_text.endswith('}'):
+                                fixed_text += '}'
                             
-                            sentiment_match = re.search(r'"sentiment":\s*"([^"]*)"', analysis_text)
-                            emotion_match = re.search(r'"customer_emotion_journey":\s*"([^"]*)"', analysis_text)
-                            topic_match = re.search(r'"topic_identification":\s*"([^"]*)"', analysis_text)
-                            intent_match = re.search(r'"primary_call_intent":\s*"([^"]*)"', analysis_text)
-                            transfer_match = re.search(r'"transfer_reason":\s*"([^"]*)"', analysis_text)
-                            competitors_match = re.search(r'"competitors_mentioned":\s*"([^"]*)"', analysis_text)
-                            themes_match = re.search(r'"key_themes_identified":\s*"([^"]*)"', analysis_text)
-                            context_match = re.search(r'"overall_context":\s*"([^"]*)"', analysis_text)
-                            
-                            analysis_data = {
-                                "sentiment": sentiment_match.group(1) if sentiment_match else "Unable to parse - truncated response",
-                                "customer_emotion_journey": emotion_match.group(1) if emotion_match else "Unable to parse - truncated response",
-                                "topic_identification": topic_match.group(1) if topic_match else "Unable to parse - truncated response", 
-                                "primary_call_intent": intent_match.group(1) if intent_match else "Unable to parse - truncated response",
-                                "transfer_reason": transfer_match.group(1) if transfer_match else "Unable to parse - truncated response",
-                                "competitors_mentioned": competitors_match.group(1) if competitors_match else "Unable to parse - truncated response",
-                                "key_themes_identified": themes_match.group(1) if themes_match else "Unable to parse - truncated response",
-                                "overall_context": context_match.group(1) if context_match else "Unable to parse - truncated response"
-                            }
+                            analysis_data = json.loads(fixed_text)
                         except:
-                            analysis_data = {
-                                "sentiment": f"PARSING ERROR - Raw response: {analysis_text[:100]}...",
-                                "customer_emotion_journey": "PARSING ERROR - Unable to extract data",
-                                "topic_identification": "PARSING ERROR - Unable to extract data", 
-                                "primary_call_intent": "PARSING ERROR - Unable to extract data",
-                                "transfer_reason": "PARSING ERROR - Unable to extract data",
-                                "competitors_mentioned": "PARSING ERROR - Unable to extract data",
-                                "key_themes_identified": "PARSING ERROR - Unable to extract data",
-                                "overall_context": "PARSING ERROR - Unable to extract data"
-                            }
+                            # Extract partial data using regex
+                            try:
+                                import re
+                                
+                                sentiment_match = re.search(r'"sentiment":\s*"([^"]*)"', analysis_text)
+                                emotion_match = re.search(r'"customer_emotion_journey":\s*"([^"]*)"', analysis_text)
+                                topic_match = re.search(r'"topic_identification":\s*"([^"]*)"', analysis_text)
+                                intent_match = re.search(r'"primary_call_intent":\s*"([^"]*)"', analysis_text)
+                                transfer_match = re.search(r'"transfer_reason":\s*"([^"]*)"', analysis_text)
+                                competitors_match = re.search(r'"competitors_mentioned":\s*"([^"]*)"', analysis_text)
+                                themes_match = re.search(r'"key_themes_identified":\s*"([^"]*)"', analysis_text)
+                                context_match = re.search(r'"overall_context":\s*"([^"]*)"', analysis_text)
+                                
+                                analysis_data = {
+                                    "sentiment": sentiment_match.group(1) if sentiment_match else "Unable to parse - truncated response",
+                                    "customer_emotion_journey": emotion_match.group(1) if emotion_match else "Unable to parse - truncated response",
+                                    "topic_identification": topic_match.group(1) if topic_match else "Unable to parse - truncated response", 
+                                    "primary_call_intent": intent_match.group(1) if intent_match else "Unable to parse - truncated response",
+                                    "transfer_reason": transfer_match.group(1) if transfer_match else "Unable to parse - truncated response",
+                                    "competitors_mentioned": competitors_match.group(1) if competitors_match else "Unable to parse - truncated response",
+                                    "key_themes_identified": themes_match.group(1) if themes_match else "Unable to parse - truncated response",
+                                    "overall_context": context_match.group(1) if context_match else "Unable to parse - truncated response"
+                                }
+                            except:
+                                analysis_data = {
+                                    "sentiment": f"PARSING ERROR - Raw response: {analysis_text[:100]}...",
+                                    "customer_emotion_journey": "PARSING ERROR - Unable to extract data",
+                                    "topic_identification": "PARSING ERROR - Unable to extract data", 
+                                    "primary_call_intent": "PARSING ERROR - Unable to extract data",
+                                    "transfer_reason": "PARSING ERROR - Unable to extract data",
+                                    "competitors_mentioned": "PARSING ERROR - Unable to extract data",
+                                    "key_themes_identified": "PARSING ERROR - Unable to extract data",
+                                    "overall_context": "PARSING ERROR - Unable to extract data"
+                                }
         
         except Exception as api_error:
             analysis_data = {
@@ -519,19 +546,19 @@ def home():
 
 if __name__ == "__main__":
     print("🚀 Starting Call Analysis API - NO RETELL SDK DEPENDENCIES...")
-    # print("📋 Available endpoints:")
-    # print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
-    # print("  📥 POST /webhook/retell - Webhook for new call data")
-    # print("  POST /analyze-call - Analyze a single call")
-    # print("  GET /auto-processing/status - Auto-processing status")
-    # print("  POST /auto-processing/start - Start auto-processing")
-    # print("  POST /auto-processing/stop - Stop auto-processing")
-    # print("  GET /get-analysis/<call_id> - Get specific call analysis")
-    # print("  GET /get-all-analysis - Get all analyses")
-    # print("  GET /stats - Database statistics")
-    # print("  GET /health - Health check")
-    # print("🌐 Main sharing endpoint: /public-data")
-    # print("📥 Webhook endpoint: /webhook/retell")
+    print("📋 Available endpoints:")
+    print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
+    print("  📥 POST /webhook/retell - Webhook for new call data")
+    print("  POST /analyze-call - Analyze a single call")
+    print("  GET /auto-processing/status - Auto-processing status")
+    print("  POST /auto-processing/start - Start auto-processing")
+    print("  POST /auto-processing/stop - Stop auto-processing")
+    print("  GET /get-analysis/<call_id> - Get specific call analysis")
+    print("  GET /get-all-analysis - Get all analyses")
+    print("  GET /stats - Database statistics")
+    print("  GET /health - Health check")
+    print("🌐 Main sharing endpoint: /public-data")
+    print("📥 Webhook endpoint: /webhook/retell")
     
     # Start auto-processing
     start_auto_processing()
