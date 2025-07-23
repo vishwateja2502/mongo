@@ -13,7 +13,8 @@ try:
     # OpenAI client for LLM call
     llm_client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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"
+        api_key="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"
+        
     )
     print("✅ OpenAI client initialized successfully")
 except Exception as e:
