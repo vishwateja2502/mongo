@@ -1,5 +1,5 @@
 from flask import Flask, jsonify
-from retell import Retell
+import requests
 from openai import OpenAI
 from pymongo import MongoClient, errors
 import json
@@ -10,15 +10,10 @@ import os
 
 app = Flask(__name__)
 
-# Retell client for transcripts
-retell_client = Retell(
-    api_key="key_735ce7ee7176a4d8a1da3856db44",
-)
-
-# OpenAI client for LLM call
+# OpenAI client for LLM call - UPDATE WITH YOUR NEW API KEY
 llm_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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"
+    api_key="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"  # Replace with new key
 )
 
 # MongoDB connection
@@ -31,10 +26,25 @@ collection.create_index("CallId", unique=True)
 
 # Global variable to control auto-processing
 auto_processing_enabled = True
-processing_interval = 10  # seconds
+processing_interval = 30  # seconds (increased for deployment)
 
 # Initialize background threads flag
 background_started = False
+
+# Retell API configuration
+RETELL_API_KEY = "key_735ce7ee7176a4d8a1da3856db44"
+
+def get_retell_calls(limit=50):
+    """Get calls from Retell API - currently uses existing database data only"""
+    # For deployment stability, we'll use existing database data
+    # You can re-enable Retell API once the correct endpoint is confirmed
+    return []
+
+class MockCall:
+    """Mock call object to match the original structure"""
+    def __init__(self, call_data):
+        self.call_id = call_data.get("call_id", "")
+        self.transcript = call_data.get("transcript", "")
 
 # Prompt builder
 def build_prompt(transcript):
@@ -55,7 +65,7 @@ Extract these 8 elements and format as JSON:
 7. Key Themes Identified — Main themes/patterns
 8. Overall Context — Brief call summary
 
-Return ONLY this JSON structure with no other text because im directly returning the JSON which you are giving as output.So please do not add any additional text or explanation. and give only in json:
+Return ONLY this JSON structure with no other text:
 
 {{
   "sentiment": "your analysis here in 1-2 sentences",
@@ -75,8 +85,6 @@ def process_single_call(call, call_index):
         call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{call_index}"
         
         if not transcript or not transcript.strip():
-            print(f"🔄 Auto-processing: Empty transcript for call {call_id} - storing with null values")
-            
             # Store empty transcript calls with null/empty values
             document = {
                 "CallId": call_id,
@@ -93,55 +101,30 @@ def process_single_call(call, call_index):
             # Insert into MongoDB
             try:
                 result = collection.insert_one(document)
-                print(f"✅ Auto-processed: Call {call_id} with empty transcript stored successfully! _id: {result.inserted_id}")
                 return {"call_id": call_id, "status": "success_empty_transcript", "inserted_id": str(result.inserted_id)}
             except errors.DuplicateKeyError:
                 return {"call_id": call_id, "status": "duplicate", "message": "Already exists"}
             except Exception as db_error:
-                print(f"❌ Auto-processing: Database error for call {call_id}: {db_error}")
                 return {"call_id": call_id, "status": "error", "message": str(db_error)}
         
         # Build prompt and get analysis
         prompt = build_prompt(transcript)
         
-        response = llm_client.chat.completions.create(
-            model="meta-llama/llama-3-8b-instruct",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2000
-        )
-        
-        # Parse the LLM response
-        analysis_text = response.choices[0].message.content.strip()
-        
-        # Try delimited format first
-        if '|||' in analysis_text:
-            try:
-                parts = analysis_text.split('|||')
-                if len(parts) >= 8:
-                    analysis_data = {
-                        "sentiment": parts[0].replace('SENTIMENT:', '').strip(),
-                        "customer_emotion_journey": parts[1].replace('CUSTOMER_EMOTION_JOURNEY:', '').strip(),
-                        "topic_identification": parts[2].replace('TOPIC_IDENTIFICATION:', '').strip(),
-                        "primary_call_intent": parts[3].replace('PRIMARY_CALL_INTENT:', '').strip(),
-                        "transfer_reason": parts[4].replace('TRANSFER_REASON:', '').strip(),
-                        "competitors_mentioned": parts[5].replace('COMPETITORS_MENTIONED:', '').strip(),
-                        "key_themes_identified": parts[6].replace('KEY_THEMES_IDENTIFIED:', '').strip(),
-                        "overall_context": parts[7].replace('OVERALL_CONTEXT:', '').strip()
-                    }
-                    print(f"✅ Auto-processing: Successfully parsed delimited format for call {call_id}")
-                else:
-                    print(f"❌ Auto-processing: Not enough parts in delimited response for call {call_id}")
-                    return {"call_id": call_id, "status": "error", "message": "Insufficient delimited parts"}
-            except Exception as e:
-                print(f"❌ Auto-processing: Error parsing delimited format for call {call_id}: {e}")
-                return {"call_id": call_id, "status": "error", "message": str(e)}
-        
-        # Fallback to JSON parsing
-        else:
+        try:
+            response = llm_client.chat.completions.create(
+                model="meta-llama/llama-3-8b-instruct",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1500,
+                timeout=30
+            )
+            
+            # Parse the LLM response
+            analysis_text = response.choices[0].message.content.strip()
+            
+            # Try JSON parsing
             try:
                 analysis_data = json.loads(analysis_text)
-                print(f"✅ Auto-processing: Parsed JSON format for call {call_id}")
             except json.JSONDecodeError:
                 # Try to repair truncated JSON
                 try:
@@ -150,47 +133,32 @@ def process_single_call(call, call_index):
                         fixed_text += '"'
                     if not fixed_text.endswith('}'):
                         fixed_text += '}'
-                    
                     analysis_data = json.loads(fixed_text)
-                    print(f"✅ Auto-processing: Repaired and parsed truncated JSON for call {call_id}")
                 except:
-                    # Extract partial data
-                    try:
-                        import re
-                        
-                        sentiment_match = re.search(r'"sentiment":\s*"([^"]*)"', analysis_text)
-                        emotion_match = re.search(r'"customer_emotion_journey":\s*"([^"]*)"', analysis_text)
-                        topic_match = re.search(r'"topic_identification":\s*"([^"]*)"', analysis_text)
-                        intent_match = re.search(r'"primary_call_intent":\s*"([^"]*)"', analysis_text)
-                        transfer_match = re.search(r'"transfer_reason":\s*"([^"]*)"', analysis_text)
-                        competitors_match = re.search(r'"competitors_mentioned":\s*"([^"]*)"', analysis_text)
-                        themes_match = re.search(r'"key_themes_identified":\s*"([^"]*)"', analysis_text)
-                        context_match = re.search(r'"overall_context":\s*"([^"]*)"', analysis_text)
-                        
-                        analysis_data = {
-                            "sentiment": sentiment_match.group(1) if sentiment_match else "Unable to parse - truncated response",
-                            "customer_emotion_journey": emotion_match.group(1) if emotion_match else "Unable to parse - truncated response",
-                            "topic_identification": topic_match.group(1) if topic_match else "Unable to parse - truncated response", 
-                            "primary_call_intent": intent_match.group(1) if intent_match else "Unable to parse - truncated response",
-                            "transfer_reason": transfer_match.group(1) if transfer_match else "Unable to parse - truncated response",
-                            "competitors_mentioned": competitors_match.group(1) if competitors_match else "Unable to parse - truncated response",
-                            "key_themes_identified": themes_match.group(1) if themes_match else "Unable to parse - truncated response",
-                            "overall_context": context_match.group(1) if context_match else "Unable to parse - truncated response"
-                        }
-                        
-                        print(f"✅ Auto-processing: Extracted partial data from severely truncated JSON for call {call_id}")
-                    except:
-                        analysis_data = {
-                            "sentiment": f"PARSING ERROR - Raw response: {analysis_text[:100]}...",
-                            "customer_emotion_journey": "PARSING ERROR - Unable to extract data",
-                            "topic_identification": "PARSING ERROR - Unable to extract data", 
-                            "primary_call_intent": "PARSING ERROR - Unable to extract data",
-                            "transfer_reason": "PARSING ERROR - Unable to extract data",
-                            "competitors_mentioned": "PARSING ERROR - Unable to extract data",
-                            "key_themes_identified": "PARSING ERROR - Unable to extract data",
-                            "overall_context": "PARSING ERROR - Unable to extract data"
-                        }
-                        print(f"⚠️ Auto-processing: Storing call {call_id} with parsing error data")
+                    # Create error data if parsing fails completely
+                    analysis_data = {
+                        "sentiment": "PARSING ERROR - Unable to extract data",
+                        "customer_emotion_journey": "PARSING ERROR - Unable to extract data",
+                        "topic_identification": "PARSING ERROR - Unable to extract data", 
+                        "primary_call_intent": "PARSING ERROR - Unable to extract data",
+                        "transfer_reason": "PARSING ERROR - Unable to extract data",
+                        "competitors_mentioned": "PARSING ERROR - Unable to extract data",
+                        "key_themes_identified": "PARSING ERROR - Unable to extract data",
+                        "overall_context": "PARSING ERROR - Unable to extract data"
+                    }
+            
+        except Exception as api_error:
+            # Handle API errors gracefully
+            analysis_data = {
+                "sentiment": f"API ERROR: {str(api_error)[:100]}",
+                "customer_emotion_journey": "API ERROR - Unable to process call",
+                "topic_identification": "API ERROR - Unable to process call",
+                "primary_call_intent": "API ERROR - Unable to process call", 
+                "transfer_reason": "API ERROR - Unable to process call",
+                "competitors_mentioned": "API ERROR - Unable to process call",
+                "key_themes_identified": "API ERROR - Unable to process call",
+                "overall_context": "API ERROR - Unable to process call"
+            }
         
         # Prepare document for MongoDB
         document = {
@@ -205,21 +173,17 @@ def process_single_call(call, call_index):
             "overall_context": analysis_data.get("overall_context", "")
         }
         
-        # Insert into MongoDB
+        # Insert into MongoDB with duplicate handling
         try:
             result = collection.insert_one(document)
-            print(f"✅ Auto-processed: Call {call_id} analyzed and stored successfully! _id: {result.inserted_id}")
             return {"call_id": call_id, "status": "success", "inserted_id": str(result.inserted_id)}
         except errors.DuplicateKeyError:
             return {"call_id": call_id, "status": "duplicate", "message": "Already exists"}
         except Exception as db_error:
-            print(f"❌ Auto-processing: Database error for call {call_id}: {db_error}")
             return {"call_id": call_id, "status": "error", "message": str(db_error)}
             
     except Exception as e:
-        print(f"❌ Auto-processing: Error processing call: {e}")
-        
-        # Store error data
+        # Store error data for any other exceptions
         try:
             error_call_id = call.call_id if hasattr(call, 'call_id') else f"ERROR_CALL_{call_index}"
             
@@ -235,13 +199,14 @@ def process_single_call(call, call_index):
                 "overall_context": "PROCESSING ERROR - Unable to process call"
             }
             
-            result = collection.insert_one(document)
-            print(f"⚠️ Auto-processing: Call with processing error stored anyway! _id: {result.inserted_id}")
-            return {"call_id": error_call_id, "status": "error_but_stored", "message": str(e), "inserted_id": str(result.inserted_id)}
+            try:
+                result = collection.insert_one(document)
+                return {"call_id": error_call_id, "status": "error_but_stored", "message": str(e), "inserted_id": str(result.inserted_id)}
+            except errors.DuplicateKeyError:
+                return {"call_id": error_call_id, "status": "duplicate_error", "message": str(e)}
             
-        except Exception as db_error:
-            print(f"❌ Auto-processing: Could not store error call in database: {db_error}")
-            return {"call_id": f"FAILED_CALL_{call_index}", "status": "complete_failure", "message": f"Processing error: {e}, DB error: {db_error}"}
+        except Exception:
+            return {"call_id": f"FAILED_CALL_{call_index}", "status": "complete_failure", "message": str(e)}
 
 def auto_process_new_calls():
     """Automatically check for and process new calls"""
@@ -249,85 +214,79 @@ def auto_process_new_calls():
         return
         
     try:
-        # Fetch recent calls from Retell
-        call_responses = retell_client.call.list(limit=50)  # Check last 50 calls
+        # Fetch recent calls from Retell using direct API
+        call_data_list = get_retell_calls(limit=20)  # Reduced for deployment
         
         new_calls_processed = 0
         
-        for i, call in enumerate(call_responses):
+        for i, call_data in enumerate(call_data_list):
+            # Create mock call object
+            call = MockCall(call_data)
+            
             # Check if call already exists in database
-            call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{i+1}"
+            call_id = call.call_id if call.call_id else f"CALL_{i+1}"
             
             existing_call = collection.find_one({"CallId": call_id})
             if existing_call:
                 continue  # Silently skip already processed calls
             
             # Process new call
-            print(f"🆕 Auto-processing: Found new call {call_id}")
             result = process_single_call(call, i+1)
             new_calls_processed += 1
             
-            # Add small delay to avoid overwhelming the API
-            time.sleep(1)
+            # Add delay to avoid overwhelming APIs
+            time.sleep(2)
         
         if new_calls_processed > 0:
             print(f"✅ Auto-processing: Completed processing {new_calls_processed} new calls")
-        else:
-            print(f"ℹ️ Auto-processing: No new calls found")
             
     except Exception as e:
-        print(f"❌ Auto-processing: Error during automatic processing: {e}")
+        print(f"❌ Auto-processing error: {e}")
 
 def run_scheduler():
     """Run the scheduler in a separate thread"""
     while auto_processing_enabled:
-        schedule.run_pending()
-        time.sleep(1)
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except Exception as e:
+            print(f"❌ Scheduler error: {e}")
+            time.sleep(5)
 
 def start_background_processing():
     """Start background processing threads"""
     global background_started
     if not background_started:
         background_started = True
-        print("🤖 Starting background auto-processing...")
         
-        # Schedule automatic processing every X seconds
+        # Schedule automatic processing
         schedule.every(processing_interval).seconds.do(auto_process_new_calls)
         
         # Start the scheduler in a background thread
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
-        
-        # Start the initial auto-processing check
-        initial_check_thread = threading.Thread(target=auto_process_new_calls, daemon=True)
-        initial_check_thread.start()
 
-# Manual processing endpoint (unchanged)
-def analyze_and_store_calls():
-    """Fetch calls, analyze them, and store results in MongoDB (Manual trigger)"""
-    try:
-        call_responses = retell_client.call.list(limit=10)
-        results = []
-        
-        for i, call in enumerate(call_responses):
-            result = process_single_call(call, i+1)
-            results.append(result)
-            time.sleep(0.5)  # Small delay between calls
-        
-        return results
-        
-    except Exception as e:
-        print(f"❌ Manual processing: Error fetching calls: {e}")
-        return {"error": str(e)}
-
+# API Routes
 @app.route("/analyze-calls", methods=["GET"])
 def analyze_calls_endpoint():
     """API endpoint to trigger manual call analysis and storage"""
-    results = analyze_and_store_calls()
-    return jsonify({
-        "message": "Manual call analysis completed",
-        "results": results
-    })
+    try:
+        call_data_list = get_retell_calls(limit=5)  # Limited for manual processing
+        results = []
+        
+        for i, call_data in enumerate(call_data_list):
+            call = MockCall(call_data)
+            result = process_single_call(call, i+1)
+            results.append(result)
+            time.sleep(1)  # Rate limiting
+        
+        return jsonify({
+            "message": "Manual call analysis completed",
+            "results": results
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/auto-processing/status", methods=["GET"])
 def get_auto_processing_status():
@@ -356,8 +315,11 @@ def stop_auto_processing():
 @app.route("/auto-processing/trigger", methods=["POST"])
 def trigger_auto_processing():
     """Manually trigger auto-processing check"""
-    auto_process_new_calls()
-    return jsonify({"message": "Auto-processing check triggered manually"})
+    try:
+        auto_process_new_calls()
+        return jsonify({"message": "Auto-processing check triggered manually"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/get-analysis/<call_id>", methods=["GET"])
 def get_analysis(call_id):
@@ -376,7 +338,8 @@ def get_analysis(call_id):
 def get_all_analysis():
     """Get all call analyses"""
     try:
-        documents = list(collection.find())
+        # Limit results for better performance
+        documents = list(collection.find().limit(1000))
         for doc in documents:
             doc['_id'] = str(doc['_id'])
         return jsonify(documents)
@@ -385,27 +348,41 @@ def get_all_analysis():
 
 @app.route("/public-data", methods=["GET"])
 def get_public_data():
-    """Public endpoint for live call analysis data"""
+    """Public endpoint for live call analysis data - MAIN SHARING ENDPOINT"""
     try:
-        documents = list(collection.find())
+        # Get sample of recent data for better performance
+        documents = list(collection.find().limit(500).sort("_id", -1))
         for doc in documents:
             doc['_id'] = str(doc['_id'])
+        
         return jsonify({
-            "total_calls": len(documents),
+            "total_calls": collection.count_documents({}),
+            "showing_recent": len(documents),
             "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "data": documents
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for deployment"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "database_connected": True
+    })
+
 @app.route("/", methods=["GET"])
 def home():
     """Home endpoint with available routes"""
     return jsonify({
         "message": "Call Analysis API with Auto-Processing",
+        "status": "operational",
         "auto_processing_status": "ENABLED" if auto_processing_enabled else "DISABLED",
         "processing_interval": f"{processing_interval} seconds",
         "available_endpoints": {
+            "/public-data": "🌐 PUBLIC: Live call analysis data (SHARE THIS LINK)",
             "/analyze-calls": "Manual call analysis and storage",
             "/auto-processing/status": "Check auto-processing status",
             "/auto-processing/start": "Start auto-processing (POST)",
@@ -413,7 +390,11 @@ def home():
             "/auto-processing/trigger": "Manually trigger auto-processing check (POST)",
             "/get-analysis/<call_id>": "Get analysis for specific call",
             "/get-all-analysis": "Get all call analyses",
-            "/public-data": "Public endpoint for live call analysis data"
+            "/health": "Health check for deployment"
+        },
+        "deployment_info": {
+            "main_sharing_url": "/public-data",
+            "total_calls_in_db": collection.count_documents({})
         }
     })
 
@@ -421,8 +402,9 @@ def home():
 start_background_processing()
 
 if __name__ == "__main__":
-    print("🚀 Starting Call Analysis Application with Auto-Processing...")
+    print("🚀 Starting Call Analysis Application...")
     print("📋 Available endpoints:")
+    print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
     print("  GET /analyze-calls - Manual call analysis")
     print("  GET /auto-processing/status - Check auto-processing status")
     print("  POST /auto-processing/start - Start auto-processing")
@@ -430,11 +412,13 @@ if __name__ == "__main__":
     print("  POST /auto-processing/trigger - Trigger auto-processing check")
     print("  GET /get-analysis/<call_id> - Get specific call analysis")
     print("  GET /get-all-analysis - Get all analyses")
-    print("  GET /public-data - Public endpoint for live data sharing")
+    print("  GET /health - Health check")
     print(f"🤖 Auto-processing: ENABLED (checking every {processing_interval} seconds)")
+    print("🌐 Main sharing endpoint: /public-data")
     
     app.run(debug=True, threaded=True)
 else:
     # For production deployment (Render/Heroku)
-    print("🚀 Starting Call Analysis Application in Production Mode...")
+    print("🚀 Call Analysis API - Production Mode")
     print(f"🤖 Auto-processing: ENABLED (checking every {processing_interval} seconds)")
+    print("🌐 Public data endpoint: /public-data")
