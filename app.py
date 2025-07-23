@@ -1,12 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+import json
+import time
+import threading
 import requests
 from openai import OpenAI
 from pymongo import MongoClient, errors
-import json
-import threading
-import time
-import schedule
-import os
 
 app = Flask(__name__)
 
@@ -24,20 +22,85 @@ collection = db["CallInsights"]
 # Ensure uniqueness
 collection.create_index("CallId", unique=True)
 
-# Global variable to control auto-processing
+# Retell API configuration
+RETELL_API_KEY = "key_735ce7ee7176a4d8a1da3856db44"
+
+# Auto-processing control
 auto_processing_enabled = True
-processing_interval = 10  # seconds - refreshes every 10 seconds
 
-# Initialize background threads flag
-background_started = False
+def get_retell_calls_with_correct_api(limit=50):
+    """Get only the most recent calls from Retell API"""
+    try:
+        # CORRECT endpoint from Retell documentation
+        url = "https://api.retellai.com/v2/list-calls"
+        
+        headers = {
+            "Authorization": f"Bearer {RETELL_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Simplified request body - just filter criteria as per docs
+        body = {
+            "filter_criteria": {}
+        }
+        
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=15
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # The response should contain call data
+            if isinstance(data, list):
+                calls = data[:limit]  # Limit the results
+            elif isinstance(data, dict):
+                calls = (data.get("calls") or data.get("data") or data.get("results") or [])[:limit]
+            else:
+                calls = []
+            
+            if calls and len(calls) > 0:
+                # Convert to CallObject format
+                call_objects = []
+                for call_data in calls:
+                    call_id = call_data.get('call_id') or call_data.get('id') or ''
+                    transcript = call_data.get('transcript') or ''
+                    
+                    if call_id:  # Only process calls with valid IDs
+                        call_obj = CallObject(call_id=call_id, transcript=transcript)
+                        call_objects.append(call_obj)
+                
+                return call_objects
+            else:
+                return []
+                
+        elif response.status_code == 400:
+            print(f"❌ Bad Request (400) - Request format issue")
+            print(f"📄 Response: {response.text}")
+        elif response.status_code == 401:
+            print("❌ Retell API authentication failed - check your API key")
+        elif response.status_code == 403:
+            print("❌ Access forbidden - API key doesn't have permission")
+        else:
+            print(f"❌ Retell API error: {response.status_code}")
+            print(f"📄 Response: {response.text}")
+        
+        return []
+        
+    except Exception as e:
+        print(f"❌ Retell API connection failed: {e}")
+        return []
 
-def get_retell_calls(limit=50):
-    """Get calls from existing database - Retell SDK not available on deployment"""
-    # For deployment, we'll work with existing database data
-    # This ensures the app runs smoothly in production
-    return []
+class CallObject:
+    """Simple call object"""
+    def __init__(self, call_id, transcript):
+        self.call_id = call_id
+        self.transcript = transcript
 
-# Prompt builder
+# Prompt builder (unchanged as requested)
 def build_prompt(transcript):
     return f"""
 Analyze this call transcript and return ONLY a valid JSON object with no additional text or explanation:
@@ -72,12 +135,10 @@ Return ONLY this JSON structure with no other text because im directly returning
 def process_single_call(call, call_index):
     """Process a single call and return result"""
     try:
-        transcript = call.transcript
+        transcript = call.transcript if hasattr(call, 'transcript') else ""
         call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{call_index}"
         
         if not transcript or not transcript.strip():
-            print(f"🔄 Auto-processing: Empty transcript for call {call_id} - storing with null values")
-            
             # Store empty transcript calls with null/empty values
             document = {
                 "CallId": call_id,
@@ -94,12 +155,10 @@ def process_single_call(call, call_index):
             # Insert into MongoDB
             try:
                 result = collection.insert_one(document)
-                print(f"✅ Auto-processed: Call {call_id} with empty transcript stored successfully! _id: {result.inserted_id}")
                 return {"call_id": call_id, "status": "success_empty_transcript", "inserted_id": str(result.inserted_id)}
             except errors.DuplicateKeyError:
                 return {"call_id": call_id, "status": "duplicate", "message": "Already exists"}
             except Exception as db_error:
-                print(f"❌ Auto-processing: Database error for call {call_id}: {db_error}")
                 return {"call_id": call_id, "status": "error", "message": str(db_error)}
         
         # Build prompt and get analysis
@@ -132,19 +191,15 @@ def process_single_call(call, call_index):
                             "key_themes_identified": parts[6].replace('KEY_THEMES_IDENTIFIED:', '').strip(),
                             "overall_context": parts[7].replace('OVERALL_CONTEXT:', '').strip()
                         }
-                        print(f"✅ Auto-processing: Successfully parsed delimited format for call {call_id}")
                     else:
-                        print(f"❌ Auto-processing: Not enough parts in delimited response for call {call_id}")
                         return {"call_id": call_id, "status": "error", "message": "Insufficient delimited parts"}
                 except Exception as e:
-                    print(f"❌ Auto-processing: Error parsing delimited format for call {call_id}: {e}")
                     return {"call_id": call_id, "status": "error", "message": str(e)}
             
             # Fallback to JSON parsing
             else:
                 try:
                     analysis_data = json.loads(analysis_text)
-                    print(f"✅ Auto-processing: Parsed JSON format for call {call_id}")
                 except json.JSONDecodeError:
                     # Try to repair truncated JSON
                     try:
@@ -155,9 +210,8 @@ def process_single_call(call, call_index):
                             fixed_text += '}'
                         
                         analysis_data = json.loads(fixed_text)
-                        print(f"✅ Auto-processing: Repaired and parsed truncated JSON for call {call_id}")
                     except:
-                        # Extract partial data
+                        # Extract partial data using regex
                         try:
                             import re
                             
@@ -180,8 +234,6 @@ def process_single_call(call, call_index):
                                 "key_themes_identified": themes_match.group(1) if themes_match else "Unable to parse - truncated response",
                                 "overall_context": context_match.group(1) if context_match else "Unable to parse - truncated response"
                             }
-                            
-                            print(f"✅ Auto-processing: Extracted partial data from severely truncated JSON for call {call_id}")
                         except:
                             analysis_data = {
                                 "sentiment": f"PARSING ERROR - Raw response: {analysis_text[:100]}...",
@@ -193,10 +245,8 @@ def process_single_call(call, call_index):
                                 "key_themes_identified": "PARSING ERROR - Unable to extract data",
                                 "overall_context": "PARSING ERROR - Unable to extract data"
                             }
-                            print(f"⚠️ Auto-processing: Storing call {call_id} with parsing error data")
         
         except Exception as api_error:
-            print(f"❌ Auto-processing: LLM API error for call {call_id}: {api_error}")
             analysis_data = {
                 "sentiment": f"API ERROR: {str(api_error)[:100]}",
                 "customer_emotion_journey": "API ERROR - Unable to process call",
@@ -224,169 +274,142 @@ def process_single_call(call, call_index):
         # Insert into MongoDB
         try:
             result = collection.insert_one(document)
-            print(f"✅ Auto-processed: Call {call_id} analyzed and stored successfully! _id: {result.inserted_id}")
             return {"call_id": call_id, "status": "success", "inserted_id": str(result.inserted_id)}
         except errors.DuplicateKeyError:
             return {"call_id": call_id, "status": "duplicate", "message": "Already exists"}
         except Exception as db_error:
-            print(f"❌ Auto-processing: Database error for call {call_id}: {db_error}")
             return {"call_id": call_id, "status": "error", "message": str(db_error)}
             
     except Exception as e:
-        print(f"❌ Auto-processing: Error processing call: {e}")
-        
-        # Store error data
-        try:
-            error_call_id = call.call_id if hasattr(call, 'call_id') else f"ERROR_CALL_{call_index}"
-            
-            document = {
-                "CallId": error_call_id,
-                "sentiment": f"PROCESSING ERROR: {str(e)[:100]}",
-                "customer_emotion_journey": "PROCESSING ERROR - Unable to process call",
-                "topic_identification": "PROCESSING ERROR - Unable to process call",
-                "primary_call_intent": "PROCESSING ERROR - Unable to process call", 
-                "transfer_reason": "PROCESSING ERROR - Unable to process call",
-                "competitors_mentioned": "PROCESSING ERROR - Unable to process call",
-                "key_themes_identified": "PROCESSING ERROR - Unable to process call",
-                "overall_context": "PROCESSING ERROR - Unable to process call"
-            }
-            
-            try:
-                result = collection.insert_one(document)
-                print(f"⚠️ Auto-processing: Call with processing error stored anyway! _id: {result.inserted_id}")
-                return {"call_id": error_call_id, "status": "error_but_stored", "message": str(e), "inserted_id": str(result.inserted_id)}
-            except errors.DuplicateKeyError:
-                return {"call_id": error_call_id, "status": "duplicate_error", "message": str(e)}
-            
-        except Exception as db_error:
-            print(f"❌ Auto-processing: Could not store error call in database: {db_error}")
-            return {"call_id": f"FAILED_CALL_{call_index}", "status": "complete_failure", "message": f"Processing error: {e}, DB error: {db_error}"}
+        return {"call_id": call_id if 'call_id' in locals() else "unknown", "status": "error", "message": str(e)}
 
-def auto_process_new_calls():
-    """Automatically check for and process ONLY NEW calls every 10 seconds"""
-    if not auto_processing_enabled:
-        return
-        
-    try:
-        # Fetch recent calls from Retell using SDK
-        call_responses = get_retell_calls(limit=50)
-        
-        new_calls_found = []
-        
-        # FIRST: Check which calls are actually NEW
-        for i, call in enumerate(call_responses):
-            call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{i+1}"
-            
-            # Check if call already exists in database
-            existing_call = collection.find_one({"CallId": call_id})
-            if not existing_call:  # Only add if NOT in database
-                new_calls_found.append(call)
-        
-        # ONLY process if there are actually NEW calls
-        if new_calls_found:
-            print(f"🆕 Found {len(new_calls_found)} NEW calls to process")
-            
-            new_calls_processed = 0
-            for i, call in enumerate(new_calls_found):
-                call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{i+1}"
-                
-                print(f"🔄 Processing new call: {call_id}")
-                result = process_single_call(call, i+1)
-                new_calls_processed += 1
-                
-                # Add small delay to avoid overwhelming the API
-                time.sleep(1)
-            
-            print(f"✅ Auto-processing: Completed processing {new_calls_processed} new calls")
-        # If no new calls, stay completely silent
-            
-    except Exception as e:
-        print(f"❌ Auto-processing: Error during automatic processing: {e}")
-
-def run_scheduler():
-    """Run the scheduler in a separate thread"""
+def auto_check_for_new_calls():
+    """Check for new calls every 10 seconds"""
     while auto_processing_enabled:
         try:
-            schedule.run_pending()
-            time.sleep(1)
+            print("🔍 Checking for new calls...")
+            
+            # Get recent calls from Retell API
+            recent_calls = get_retell_calls_with_correct_api(limit=20)  # Only get 20 most recent
+            
+            if recent_calls:
+                # Filter for truly NEW calls (not in database)
+                new_calls = []
+                for call in recent_calls:
+                    if call.call_id:
+                        existing_call = collection.find_one({"CallId": call.call_id})
+                        if not existing_call:
+                            new_calls.append(call)
+                
+                if new_calls:
+                    print(f"🎯 Found {len(new_calls)} new calls! Pushing to database...")
+                    for call in new_calls:
+                        print(f"📞 Processing: {call.call_id}")
+                        result = process_single_call(call, 1)
+                        if result["status"] == "success":
+                            print(f"✅ Successfully stored in database")
+                        elif result["status"] == "duplicate":
+                            print(f"⚠️ Already exists in database")
+                        elif result["status"] == "success_empty_transcript":
+                            print(f"✅ Stored (empty transcript)")
+                        else:
+                            # Show the actual error message
+                            error_msg = result.get('message', 'No error message provided')
+                            print(f"❌ Error: {error_msg}")
+                            print(f"   Status: {result.get('status', 'unknown')}")
+                        time.sleep(1)  # Rate limiting
+                    print(f"🎉 Completed! {len(new_calls)} new calls processed")
+                else:
+                    print("ℹ️ No new calls found - all calls already in database")
+            else:
+                print("ℹ️ No calls retrieved from Retell API")
+            
+            print("⏰ Waiting 10 seconds before next check...\n")
+            # Wait 10 seconds before next check
+            time.sleep(10)
+            
         except Exception as e:
-            print(f"❌ Scheduler error: {e}")
-            time.sleep(5)
+            print(f"❌ Auto-processing error: {e}")
+            print("⏰ Retrying in 10 seconds...\n")
+            time.sleep(10)
 
-def start_background_processing():
-    """Start background processing threads"""
-    global background_started
-    if not background_started:
-        background_started = True
-        print("🤖 Starting background auto-processing...")
-        
-        # Schedule automatic processing every 10 seconds
-        schedule.every(processing_interval).seconds.do(auto_process_new_calls)
-        
-        # Start the scheduler in a background thread
-        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-        scheduler_thread.start()
-        
-        # Start the initial auto-processing check
-        initial_check_thread = threading.Thread(target=auto_process_new_calls, daemon=True)
-        initial_check_thread.start()
+def start_auto_processing():
+    """Start auto-processing in background thread"""
+    auto_thread = threading.Thread(target=auto_check_for_new_calls, daemon=True)
+    auto_thread.start()
+    print("🤖 Auto-processing started - ready to process new calls")
 
-def analyze_and_store_calls():
-    """Fetch calls, analyze them, and store results in MongoDB (Manual trigger)"""
+# Webhook endpoint for Retell to send new call data
+@app.route("/webhook/retell", methods=["POST"])
+def retell_webhook():
+    """Webhook endpoint for Retell to send new call data"""
     try:
-        call_responses = get_retell_calls(limit=10)
-        results = []
+        data = request.get_json()
         
-        for i, call in enumerate(call_responses):
-            result = process_single_call(call, i+1)
-            results.append(result)
-            time.sleep(0.5)  # Small delay between calls
+        # Extract call data from webhook
+        call_id = data.get("call_id", f"WEBHOOK_{int(time.time())}")
+        transcript = data.get("transcript", "")
         
-        return results
+        print(f"📥 Received webhook for call: {call_id}")
+        
+        # Create call object
+        call = CallObject(call_id, transcript)
+        
+        # Check if call already exists
+        existing_call = collection.find_one({"CallId": call_id})
+        if existing_call:
+            return jsonify({"message": "Call already processed", "call_id": call_id}), 200
+        
+        # Process the new call
+        result = process_single_call(call, 1)
+        
+        return jsonify({
+            "message": "Call processed successfully",
+            "result": result
+        }), 200
         
     except Exception as e:
-        print(f"❌ Manual processing: Error fetching calls: {e}")
-        return {"error": str(e)}
-
-@app.route("/analyze-calls", methods=["GET"])
-def analyze_calls_endpoint():
-    """API endpoint to trigger manual call analysis and storage"""
-    results = analyze_and_store_calls()
-    return jsonify({
-        "message": "Manual call analysis completed",
-        "results": results
-    })
+        print(f"❌ Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/auto-processing/status", methods=["GET"])
-def get_auto_processing_status():
-    """Get current auto-processing status"""
+def get_auto_status():
+    """Get auto-processing status"""
     return jsonify({
         "auto_processing_enabled": auto_processing_enabled,
-        "processing_interval_seconds": processing_interval,
-        "message": "Auto-processing is " + ("ENABLED" if auto_processing_enabled else "DISABLED")
+        "message": "Auto-processing is " + ("ENABLED" if auto_processing_enabled else "DISABLED"),
+        "webhook_endpoint": "/webhook/retell"
     })
-
-@app.route("/auto-processing/start", methods=["POST"])
-def start_auto_processing():
-    """Start automatic processing"""
-    global auto_processing_enabled
-    auto_processing_enabled = True
-    start_background_processing()
-    return jsonify({"message": "Auto-processing started", "status": "enabled"})
 
 @app.route("/auto-processing/stop", methods=["POST"])
 def stop_auto_processing():
-    """Stop automatic processing"""
+    """Stop auto-processing"""
     global auto_processing_enabled
     auto_processing_enabled = False
-    return jsonify({"message": "Auto-processing stopped", "status": "disabled"})
+    return jsonify({"message": "Auto-processing stopped"})
 
-@app.route("/auto-processing/trigger", methods=["POST"])
-def trigger_auto_processing():
-    """Manually trigger auto-processing check"""
+@app.route("/auto-processing/start", methods=["POST"])
+def start_auto_processing_endpoint():
+    """Start auto-processing"""
+    global auto_processing_enabled
+    auto_processing_enabled = True
+    start_auto_processing()
+    return jsonify({"message": "Auto-processing started"})
+
+@app.route("/analyze-call", methods=["POST"])
+def analyze_single_call():
+    """Analyze a single call - for manual processing"""
     try:
-        auto_process_new_calls()
-        return jsonify({"message": "Auto-processing check triggered manually"})
+        data = request.get_json()
+        transcript = data.get("transcript", "")
+        call_id = data.get("call_id", f"MANUAL_{int(time.time())}")
+        
+        # Create call object
+        call = CallObject(call_id, transcript)
+        
+        result = process_single_call(call, 1)
+        return jsonify(result)
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -432,59 +455,93 @@ def get_public_data():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint for deployment"""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "database_connected": True,
-        "auto_processing_enabled": auto_processing_enabled
-    })
+    try:
+        collection.count_documents({})
+        return jsonify({
+            "status": "healthy",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "database_connected": True,
+            "auto_processing_enabled": auto_processing_enabled
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "database_connected": False,
+            "error": str(e)
+        }), 500
+
+@app.route("/stats", methods=["GET"])
+def get_stats():
+    """Get database statistics"""
+    try:
+        total_calls = collection.count_documents({})
+        success_calls = collection.count_documents({"sentiment": {"$not": {"$regex": "ERROR"}}})
+        error_calls = collection.count_documents({"sentiment": {"$regex": "ERROR"}})
+        
+        return jsonify({
+            "total_calls": total_calls,
+            "successful_analyses": success_calls,
+            "error_analyses": error_calls,
+            "success_rate": f"{(success_calls/total_calls*100):.1f}%" if total_calls > 0 else "0%"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def home():
     """Home endpoint with available routes"""
-    return jsonify({
-        "message": "Call Analysis API with Auto-Processing",
-        "status": "operational",
-        "auto_processing_status": "ENABLED" if auto_processing_enabled else "DISABLED",
-        "processing_interval": f"{processing_interval} seconds",
-        "available_endpoints": {
-            "/public-data": "🌐 PUBLIC: Live call analysis data (SHARE THIS LINK)",
-            "/analyze-calls": "Manual call analysis and storage",
-            "/auto-processing/status": "Check auto-processing status",
-            "/auto-processing/start": "Start auto-processing (POST)",
-            "/auto-processing/stop": "Stop auto-processing (POST)", 
-            "/auto-processing/trigger": "Manually trigger auto-processing check (POST)",
-            "/get-analysis/<call_id>": "Get analysis for specific call",
-            "/get-all-analysis": "Get all call analyses",
-            "/health": "Health check for deployment"
-        },
-        "deployment_info": {
+    try:
+        total_calls = collection.count_documents({})
+        return jsonify({
+            "message": "Call Analysis API - Production Ready for Render",
+            "status": "operational",
+            "total_calls_in_database": total_calls,
+            "auto_processing_enabled": auto_processing_enabled,
+            "available_endpoints": {
+                "/public-data": "🌐 PUBLIC: Live call analysis data (SHARE THIS LINK)",
+                "/webhook/retell": "POST: Webhook for Retell to send new call data",
+                "/analyze-call": "POST: Analyze a single call (JSON: {transcript, call_id})",
+                "/auto-processing/status": "GET: Check auto-processing status",
+                "/auto-processing/start": "POST: Start auto-processing",
+                "/auto-processing/stop": "POST: Stop auto-processing",
+                "/get-analysis/<call_id>": "GET: Get analysis for specific call",
+                "/get-all-analysis": "GET: Get all call analyses",
+                "/stats": "GET: Database statistics",
+                "/health": "GET: Health check for deployment"
+            },
             "main_sharing_url": "/public-data",
-            "total_calls_in_db": collection.count_documents({})
-        }
-    })
-
-# Start background processing when app starts
-start_background_processing()
+            "webhook_url": "/webhook/retell",
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    print("🚀 Starting Call Analysis Application with Auto-Processing...")
-    print("📋 Available endpoints:")
-    print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
-    print("  GET /analyze-calls - Manual call analysis")
-    print("  GET /auto-processing/status - Check auto-processing status")
-    print("  POST /auto-processing/start - Start auto-processing")
-    print("  POST /auto-processing/stop - Stop auto-processing")
-    print("  POST /auto-processing/trigger - Trigger auto-processing check")
-    print("  GET /get-analysis/<call_id> - Get specific call analysis")
-    print("  GET /get-all-analysis - Get all analyses")
-    print("  GET /health - Health check")
-    print(f"🤖 Auto-processing: ENABLED (checking every {processing_interval} seconds)")
-    print("🌐 Main sharing endpoint: /public-data")
+    print("🚀 Starting Call Analysis API - NO RETELL SDK DEPENDENCIES...")
+    # print("📋 Available endpoints:")
+    # print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
+    # print("  📥 POST /webhook/retell - Webhook for new call data")
+    # print("  POST /analyze-call - Analyze a single call")
+    # print("  GET /auto-processing/status - Auto-processing status")
+    # print("  POST /auto-processing/start - Start auto-processing")
+    # print("  POST /auto-processing/stop - Stop auto-processing")
+    # print("  GET /get-analysis/<call_id> - Get specific call analysis")
+    # print("  GET /get-all-analysis - Get all analyses")
+    # print("  GET /stats - Database statistics")
+    # print("  GET /health - Health check")
+    # print("🌐 Main sharing endpoint: /public-data")
+    # print("📥 Webhook endpoint: /webhook/retell")
     
-    app.run(debug=True, threaded=True)
+    # Start auto-processing
+    start_auto_processing()
+    
+    print("✅ Ready for deployment on Render!")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)
 else:
-    # For production deployment (Render/Heroku)
+    # For production deployment
     print("🚀 Call Analysis API - Production Mode")
-    print(f"🤖 Auto-processing: ENABLED (checking every {processing_interval} seconds)")
     print("🌐 Public data endpoint: /public-data")
+    print("📥 Webhook endpoint: /webhook/retell")
+    start_auto_processing()
