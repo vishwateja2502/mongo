@@ -13,7 +13,7 @@ try:
     # OpenAI client for LLM call
     llm_client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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"
+        api_key="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"
     )
     print("✅ OpenAI client initialized successfully")
 except Exception as e:
@@ -35,8 +35,8 @@ RETELL_API_KEY = "key_735ce7ee7176a4d8a1da3856db44"
 # Auto-processing control
 auto_processing_enabled = True
 
-def get_retell_calls_with_correct_api(limit=50):
-    """Get only the most recent calls from Retell API"""
+def get_retell_calls_with_correct_api(limit=5):
+    """Get only the most recent 5 ended calls - focus on new calls only"""
     try:
         # CORRECT endpoint from Retell documentation
         url = "https://api.retellai.com/v2/list-calls"
@@ -46,9 +46,11 @@ def get_retell_calls_with_correct_api(limit=50):
             "Content-Type": "application/json"
         }
         
-        # Simplified request body - just filter criteria as per docs
+        # Filter for only recent ENDED calls - limit to 5 most recent
         body = {
-            "filter_criteria": {}
+            "filter_criteria": {
+                "call_status": ["ended"]  # Use "ended" as per API allowed values
+            }
         }
         
         response = requests.post(
@@ -63,20 +65,26 @@ def get_retell_calls_with_correct_api(limit=50):
             
             # The response should contain call data
             if isinstance(data, list):
-                calls = data[:limit]  # Limit the results
+                calls = data[:5]  # Only get first 5 most recent
             elif isinstance(data, dict):
-                calls = (data.get("calls") or data.get("data") or data.get("results") or [])[:limit]
+                calls = (data.get("calls") or data.get("data") or data.get("results") or [])[:5]
             else:
                 calls = []
             
             if calls and len(calls) > 0:
-                # Convert to CallObject format
+                # Convert to CallObject format - ONLY calls with actual transcripts
                 call_objects = []
                 for call_data in calls:
                     call_id = call_data.get('call_id') or call_data.get('id') or ''
                     transcript = call_data.get('transcript') or ''
+                    call_status = call_data.get('call_status', '')
                     
-                    if call_id:  # Only process calls with valid IDs
+                    # ONLY process ended calls with actual transcript content
+                    if (call_id and 
+                        call_status == "ended" and 
+                        transcript and 
+                        len(transcript.strip()) > 20):  # At least 20 characters of actual content
+                        
                         call_obj = CallObject(call_id=call_id, transcript=transcript)
                         call_objects.append(call_obj)
                 
@@ -145,28 +153,9 @@ def process_single_call(call, call_index):
         transcript = call.transcript if hasattr(call, 'transcript') else ""
         call_id = call.call_id if hasattr(call, 'call_id') else f"CALL_{call_index}"
         
-        if not transcript or not transcript.strip():
-            # Store empty transcript calls with null/empty values
-            document = {
-                "CallId": call_id,
-                "sentiment": "No transcript available",
-                "customer_emotion_journey": "No transcript available", 
-                "topic_identification": "No transcript available",
-                "primary_call_intent": "No transcript available",
-                "transfer_reason": "No transcript available",
-                "competitors_mentioned": "No transcript available",
-                "key_themes_identified": "No transcript available",
-                "overall_context": "No transcript available"
-            }
-            
-            # Insert into MongoDB
-            try:
-                result = collection.insert_one(document)
-                return {"call_id": call_id, "status": "success_empty_transcript", "inserted_id": str(result.inserted_id)}
-            except errors.DuplicateKeyError:
-                return {"call_id": call_id, "status": "duplicate", "message": "Already exists"}
-            except Exception as db_error:
-                return {"call_id": call_id, "status": "error", "message": str(db_error)}
+        if not transcript or not transcript.strip() or len(transcript.strip()) <= 20:
+            # Skip calls without proper transcript content
+            return {"call_id": call_id, "status": "skipped", "message": "No transcript content - call may not be completed yet"}
         
         # Build prompt and get analysis
         prompt = build_prompt(transcript)
@@ -316,17 +305,25 @@ def auto_check_for_new_calls():
         try:
             print("🔍 Checking for new calls...")
             
-            # Get recent calls from Retell API
-            recent_calls = get_retell_calls_with_correct_api(limit=20)  # Only get 20 most recent
+            # Get only 5 most recent calls from Retell API  
+            recent_calls = get_retell_calls_with_correct_api(limit=5)
             
             if recent_calls:
+                print(f"📋 Retrieved {len(recent_calls)} ended calls with transcripts from Retell")
+                
                 # Filter for truly NEW calls (not in database)
                 new_calls = []
+                already_processed = 0
+                
                 for call in recent_calls:
                     if call.call_id:
                         existing_call = collection.find_one({"CallId": call.call_id})
                         if not existing_call:
                             new_calls.append(call)
+                        else:
+                            already_processed += 1
+                
+                print(f"📊 Status: {len(new_calls)} new calls, {already_processed} already in database")
                 
                 if new_calls:
                     print(f"🎯 Found {len(new_calls)} new calls! Pushing to database...")
