@@ -4,17 +4,21 @@ import time
 import threading
 import requests
 from pymongo import MongoClient, errors
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
 # Import OpenAI with error handling for version compatibility
 try:
     from openai import OpenAI
-    # OpenAI client for LLM call
+    # OpenAI client for LLM call - using environment variable
     llm_client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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"
-        
+        api_key=os.getenv('OPENAI_API_KEY')
     )
     print("✅ OpenAI client initialized successfully")
 except Exception as e:
@@ -22,16 +26,19 @@ except Exception as e:
     # Fallback - app will still work for serving existing data
     llm_client = None
 
-# MongoDB connection
-client = MongoClient("mongodb+srv://vishwateja2502:vishwa%4025@cluster0.ig42emq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-db = client["CallAnalysisDB"]
-collection = db["CallInsights"]
+# MongoDB connection - using environment variable
+try:
+    client = MongoClient(os.getenv('MONGODB_URI'))
+    db = client["CallAnalysisDB"]
+    collection = db["CallInsights"]
+    # Ensure uniqueness
+    collection.create_index("CallId", unique=True)
+    print("✅ MongoDB connected successfully")
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
 
-# Ensure uniqueness
-collection.create_index("CallId", unique=True)
-
-# Retell API configuration
-RETELL_API_KEY = "key_735ce7ee7176a4d8a1da3856db44"
+# Retell API configuration - using environment variable
+RETELL_API_KEY = os.getenv('RETELL_API_KEY')
 
 # Auto-processing control
 auto_processing_enabled = True
@@ -148,6 +155,48 @@ Return ONLY this JSON structure with no other text because im directly returning
   "overall_context": "your analysis here in 1-2 sentences"
 }}"""
 
+def auto_check_for_new_calls():
+    """Check for new calls every 10 seconds"""
+    while auto_processing_enabled:
+        try:
+            print("🔍 Checking for new calls...")
+            
+            # Get only 5 most recent calls from Retell API  
+            recent_calls = get_retell_calls_with_correct_api(limit=5)
+            
+            # Filter for truly NEW calls (not in database)
+            new_calls = []
+            for call in recent_calls:
+                if call.call_id:
+                    existing_call = collection.find_one({"CallId": call.call_id})
+                    if not existing_call:
+                        new_calls.append(call)
+            
+            # ONLY show output if there are NEW calls
+            if new_calls:
+                print(f"🆕 Found {len(new_calls)} NEW calls! Processing...")
+                for call in new_calls:
+                    print(f"📞 {call.call_id}")
+                    result = process_single_call(call, 1)
+                    if result["status"] == "success":
+                        print(f"✅ Analyzed and stored")
+                    else:
+                        print(f"❌ Error: {result.get('message', 'Unknown error')}")
+                    time.sleep(1)
+            
+            # Wait 10 seconds before next check
+            time.sleep(10)
+            
+        except Exception as e:
+            print(f"❌ Auto-processing error: {e}")
+            time.sleep(10)
+
+def start_auto_processing():
+    """Start auto-processing in background thread"""
+    auto_thread = threading.Thread(target=auto_check_for_new_calls, daemon=True)
+    auto_thread.start()
+    print("🤖 Auto-processing started - ready to process new calls")
+
 def process_single_call(call, call_index):
     """Process a single call and return result"""
     try:
@@ -175,13 +224,6 @@ def process_single_call(call, call_index):
                     "overall_context": "OpenAI client not available - deployment issue"
                 }
             else:
-                response = llm_client.chat.completions.create(
-                    model="meta-llama/llama-3-8b-instruct",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=2000,
-                    timeout=30
-                )
                 response = llm_client.chat.completions.create(
                     model="meta-llama/llama-3-8b-instruct",
                     messages=[{"role": "user", "content": prompt}],
@@ -299,70 +341,6 @@ def process_single_call(call, call_index):
             
     except Exception as e:
         return {"call_id": call_id if 'call_id' in locals() else "unknown", "status": "error", "message": str(e)}
-
-def auto_check_for_new_calls():
-    """Check for new calls every 10 seconds"""
-    while auto_processing_enabled:
-        try:
-            print("🔍 Checking for new calls...")
-            
-            # Get only 5 most recent calls from Retell API  
-            recent_calls = get_retell_calls_with_correct_api(limit=5)
-            
-            if recent_calls:
-                print(f"📋 Retrieved {len(recent_calls)} ended calls with transcripts from Retell")
-                
-                # Filter for truly NEW calls (not in database)
-                new_calls = []
-                already_processed = 0
-                
-                for call in recent_calls:
-                    if call.call_id:
-                        existing_call = collection.find_one({"CallId": call.call_id})
-                        if not existing_call:
-                            new_calls.append(call)
-                        else:
-                            already_processed += 1
-                
-                print(f"📊 Status: {len(new_calls)} new calls, {already_processed} already in database")
-                
-                if new_calls:
-                    print(f"🎯 Found {len(new_calls)} new calls! Pushing to database...")
-                    for call in new_calls:
-                        print(f"📞 Processing: {call.call_id}")
-                        result = process_single_call(call, 1)
-                        if result["status"] == "success":
-                            print(f"✅ Successfully stored in database")
-                        elif result["status"] == "duplicate":
-                            print(f"⚠️ Already exists in database")
-                        elif result["status"] == "success_empty_transcript":
-                            print(f"✅ Stored (empty transcript)")
-                        else:
-                            # Show the actual error message
-                            error_msg = result.get('message', 'No error message provided')
-                            print(f"❌ Error: {error_msg}")
-                            print(f"   Status: {result.get('status', 'unknown')}")
-                        time.sleep(1)  # Rate limiting
-                    print(f"🎉 Completed! {len(new_calls)} new calls processed")
-                else:
-                    print("ℹ️ No new calls found - all calls already in database")
-            else:
-                print("ℹ️ No calls retrieved from Retell API")
-            
-            print("⏰ Waiting 10 seconds before next check...\n")
-            # Wait 10 seconds before next check
-            time.sleep(10)
-            
-        except Exception as e:
-            print(f"❌ Auto-processing error: {e}")
-            print("⏰ Retrying in 10 seconds...\n")
-            time.sleep(10)
-
-def start_auto_processing():
-    """Start auto-processing in background thread"""
-    auto_thread = threading.Thread(target=auto_check_for_new_calls, daemon=True)
-    auto_thread.start()
-    print("🤖 Auto-processing started - ready to process new calls")
 
 # Webhook endpoint for Retell to send new call data
 @app.route("/webhook/retell", methods=["POST"])
@@ -519,7 +497,7 @@ def home():
     try:
         total_calls = collection.count_documents({})
         return jsonify({
-            "message": "Call Analysis API - Production Ready for Render",
+            "message": "Call Analysis API - Production Ready with Environment Variables",
             "status": "operational",
             "total_calls_in_database": total_calls,
             "auto_processing_enabled": auto_processing_enabled,
@@ -543,7 +521,7 @@ def home():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    print("🚀 Starting Call Analysis API - NO RETELL SDK DEPENDENCIES...")
+    print("🚀 Starting Call Analysis API with Environment Variables...")
     print("📋 Available endpoints:")
     print("  🌐 GET /public-data - PUBLIC: Live call analysis data")
     print("  📥 POST /webhook/retell - Webhook for new call data")
@@ -561,7 +539,7 @@ if __name__ == "__main__":
     # Start auto-processing
     start_auto_processing()
     
-    print("✅ Ready for deployment on Render!")
+    print("✅ Ready for deployment!")
     
     app.run(host='0.0.0.0', port=5000, debug=False)
 else:
